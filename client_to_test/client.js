@@ -5,10 +5,28 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const proxyUrl = 'http://xc1:Func2test@192.168.131.131:3456';
 const agent = new HttpsProxyAgent(proxyUrl);
 
-https.get('https://jsonplaceholder.typicode.com/users/1', { agent }, (res) => {
-    console.log(`Status: ${res.statusCode}`);
-    res.on('data', (chunk) => process.stdout.write(chunk));
-});
+https
+    .get('https://jsonplaceholder.typicode.com/users/1', { agent }, (res) => {
+        console.log(`Status: ${res.statusCode}`);
+        // res.on('data', (chunk) => process.stdout.write(chunk));
+
+        let rawData = '';
+        res.on('data', (chunk) => {
+            rawData += chunk;
+        });
+
+        res.on('end', () => {
+            try {
+                const jsonData = JSON.parse(rawData);
+                console.log('PARSED JSON: ', jsonData);
+            } catch (err) {
+                console.log('Failed to get response ', err);
+            }
+        });
+    })
+    .on('error', (err) => {
+        console.error('Request error: ', err);
+    });
 
 // http.get('http://httpbin.org/get', { agent }, (res) => {
 //     console.log('-------------------- Testing HTTP target');

@@ -4,6 +4,30 @@ const http = require('http');
 const net = require('net');
 const url = require('url');
 const { Buffer } = require('buffer');
+const fs = require('fs');
+const path = require('path');
+const rfs = require('rotating-file-stream');
+
+const logDirectory = path.join(__dirname, 'logs');
+fs.mkdirSync(logDirectory, { recursive: true });
+
+const accessLogStream = rfs.createStream(
+    (time, index) => {
+        if (!time) return 'proxy.log';
+
+        const year = time.getFullYear();
+        const month = String(time.getMonth() + 1).padStart(2, '0');
+        const day = String(time.getDate()).padStart(2, '0');
+
+        return `proxy-${year}-${month}-${day}.log`;
+    },
+    {
+        interval: '1d',
+        path: logDirectory,
+        maxFiles: 7,
+        compress: 'gzip'
+    }
+);
 
 const PROXY_PORT = process.env.HTTP_PORT || 3456;
 const AUTH_USER = process.env.PROXY_USER;
@@ -19,7 +43,33 @@ function isAuthenticated(authHeader) {
 }
 
 function logRequest(method, targetUrl) {
-    console.log(`[${new Date().toISOString()}] ${method} ${targetUrl}`);
+    const logLine = `[${new Date().toISOString()}] ${method} ${targetUrl}\n`;
+
+    console.log(logLine.trim());
+
+    // Write to log file
+    accessLogStream.write(logLine);
+}
+
+function log(...args) {
+    const timestamp = new Date().toISOString();
+    const message = args
+        .map((arg) => {
+            if (typeof arg === 'object') {
+                try {
+                    return JSON.stringify(arg);
+                } catch {
+                    return '[Unserializable Object]';
+                }
+            }
+            return String(arg);
+        })
+        .join(' ');
+
+    const fullLine = `[${timestamp}] ${message}\n`;
+
+    console.log(fullLine.trim());
+    accessLogStream.write(fullLine);
 }
 
 // Handles HTTP requests through the proxy
@@ -48,7 +98,7 @@ const httpServer = http.createServer((clientReq, clientRes) => {
     });
 
     proxyReq.on('error', (err) => {
-        console.error('HTTP proxy error:', err.message);
+        log('HTTP proxy error:', err.message);
         clientRes.writeHead(500);
         clientRes.end('Proxy Error');
     });
@@ -59,7 +109,7 @@ const httpServer = http.createServer((clientReq, clientRes) => {
 // Handles HTTPS requests through the proxy (CONNECT method)
 httpServer.on('connect', (req, clientSocket, head) => {
     const proxyAuth = req.headers['proxy-authorization'];
-    console.log(`Received request with method: ${req.method} on url: ${req.url}`);
+    log(`Received request with method: ${req.method} on url: ${req.url}`);
 
     if (!isAuthenticated(proxyAuth)) {
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n');
@@ -80,12 +130,16 @@ httpServer.on('connect', (req, clientSocket, head) => {
     });
 
     targetSocket.on('error', (err) => {
-        console.error('HTTPS tunnel error:', err.message);
+        log('HTTPS tunnel error:', err.message);
         clientSocket.write('HTTP/1.1 500 Tunnel Error\r\n\r\n');
         clientSocket.end();
     });
 });
 
 httpServer.listen(PROXY_PORT, () => {
-    console.log(`Proxy server listening on port ${PROXY_PORT}`);
+    log('*********************************************');
+    log('*********************************************');
+    log(`Proxy server listening on port ${PROXY_PORT}`);
+    log('*********************************************');
+    log('*********************************************');
 });
