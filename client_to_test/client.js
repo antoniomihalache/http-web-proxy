@@ -1,74 +1,41 @@
 const https = require('https');
-const http = require('http');
 const { HttpsProxyAgent } = require('https-proxy-agent');
+const fs = require('fs');
 
-const proxyUrl = 'http://xc1:Func2test@192.168.131.131:3456';
+// ===== CONFIGURATION =====
+const USE_HTTPS_PROXY = true; // Set to false if your proxy uses HTTP
+const PROXY_HOST = '192.168.131.131';
+const PROXY_PORT = USE_HTTPS_PROXY ? 4433 : 3456;
+const PROXY_USER = 'xc1';
+const PROXY_PASS = 'Func2test';
+const TARGET_URL = 'https://jsonplaceholder.typicode.com/users/1';
+
+// ===== OPTIONAL: Trust self-signed certs (for dev only) =====
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'; // ⚠️ Dev only
+
+// ===== CREATE PROXY AGENT =====
+const proxyProtocol = USE_HTTPS_PROXY ? 'https' : 'http';
+const proxyUrl = `${proxyProtocol}://${PROXY_USER}:${PROXY_PASS}@${PROXY_HOST}:${PROXY_PORT}`;
+console.log('------------- proxyProtocol is: ', proxyProtocol);
 const agent = new HttpsProxyAgent(proxyUrl);
 
+// ===== MAKE REQUEST THROUGH PROXY =====
 https
-    .get('https://jsonplaceholder.typicode.com/users/1', { agent }, (res) => {
-        console.log(`Status: ${res.statusCode}`);
-        // res.on('data', (chunk) => process.stdout.write(chunk));
+    .get(TARGET_URL, { agent }, (res) => {
+        console.log(`\n✅ Status: ${res.statusCode}`);
 
         let rawData = '';
-        res.on('data', (chunk) => {
-            rawData += chunk;
-        });
-
+        res.on('data', (chunk) => (rawData += chunk));
         res.on('end', () => {
             try {
-                const jsonData = JSON.parse(rawData);
-                console.log('PARSED JSON: ', jsonData);
+                const json = JSON.parse(rawData);
+                console.log('\n✅ Parsed JSON:\n', json);
             } catch (err) {
-                console.log('Failed to get response ', err);
+                console.error('\n❌ Failed to parse JSON:', err);
+                console.log('\nRaw Response:\n', rawData);
             }
         });
     })
     .on('error', (err) => {
-        console.error('Request error: ', err);
+        console.error('\n❌ Request error:', err);
     });
-
-// http.get('http://httpbin.org/get', { agent }, (res) => {
-//     console.log('-------------------- Testing HTTP target');
-//     console.log(`Status: ${res.statusCode}`);
-//     res.on('data', (chunk) => process.stdout.write(chunk));
-// });
-
-// POST
-// const data = JSON.stringify({
-//     name: 'antonio',
-//     email: 'antonio@example.com'
-// });
-
-// const options = {
-//     hostname: 'jsonplaceholder.typicode.com',
-//     port: 443,
-//     path: '/posts',
-//     method: 'POST',
-//     headers: {
-//         'Content-Type': 'application/json',
-//         'Content-Length': Buffer.byteLength(data)
-//     },
-//     agent
-// };
-
-// const req = https.request(options, (res) => {
-//     console.log(`Status: ${res.statusCode}`);
-
-//     res.setEncoding('utf8');
-//     res.on('data', (chunk) => {
-//         process.stdout.write(chunk);
-//     });
-
-//     res.on('end', () => {
-//         console.log('\n✅ POST complete');
-//     });
-// });
-
-// req.on('error', (err) => {
-//     console.error(`❌ Request error: ${err.message}`);
-// });
-
-// // Write the request body and end it
-// req.write(data);
-// req.end();
