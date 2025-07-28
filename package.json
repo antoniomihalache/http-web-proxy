@@ -1,0 +1,26 @@
+{
+  "name": "http-web-proxy",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antoniomihalache/http-web-proxy.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/antoniomihalache/http-web-proxy/issues"
+  },
+  "homepage": "https://github.com/antoniomihalache/http-web-proxy#readme",
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "https-proxy-agent": "^7.0.6"
+  }
+}
