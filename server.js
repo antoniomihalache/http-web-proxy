@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const https = require('https');
 const http = require('http');
 const net = require('net');
 const url = require('url');
@@ -11,69 +12,69 @@ const rfs = require('rotating-file-stream');
 const logDirectory = path.join(__dirname, 'logs');
 fs.mkdirSync(logDirectory, { recursive: true });
 
+const serverOptions = {
+    key: fs.readFileSync('./certs/key.pem'),
+    cert: fs.readFileSync('./certs/cert.pem')
+};
+
 const accessLogStream = rfs.createStream(
-    (time, index) => {
-        if (!time) return 'proxy.log';
-
-        const year = time.getFullYear();
-        const month = String(time.getMonth() + 1).padStart(2, '0');
-        const day = String(time.getDate()).padStart(2, '0');
-
-        return `proxy-${year}-${month}-${day}.log`;
+    (time) => {
+        const now = time || new Date();
+        return `proxy-${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+            now.getDate()
+        ).padStart(2, '0')}.log`;
     },
     {
         interval: '1d',
         path: logDirectory,
-        maxFiles: 7,
-        compress: 'gzip'
+        compress: 'gzip',
+        maxFiles: 7
     }
 );
 
-const PROXY_PORT = process.env.HTTP_PORT || 3456;
+const HTTP_PORT = process.env.HTTP_PORT || 3456;
+const HTTPS_PORT = process.env.HTTPS_PORT || 4433;
 const AUTH_USER = process.env.PROXY_USER;
 const AUTH_PASS = process.env.PROXY_PASSWORD;
+
+const HOP_BY_HOP = new Set([
+    'connection',
+    'proxy-connection',
+    'keep-alive',
+    'transfer-encoding',
+    'upgrade',
+    'te',
+    'trailer'
+]);
+
+function scrubHeaders(headers) {
+    const out = { ...headers };
+    delete out['proxy-authorization'];
+    Object.keys(out).forEach((k) => {
+        if (HOP_BY_HOP.has(k.toLowerCase())) delete out[k];
+    });
+    out['connection'] = 'close';
+    return out;
+}
 
 // Basic Auth Validation
 function isAuthenticated(authHeader) {
     if (!authHeader || !authHeader.startsWith('Basic ')) return false;
-    const encoded = authHeader.slice(6); // remove "Basic "
+    const encoded = authHeader.slice(6);
     const decoded = Buffer.from(encoded, 'base64').toString('utf8');
     const [user, pass] = decoded.split(':');
     return user === AUTH_USER && pass === AUTH_PASS;
 }
 
-function logRequest(method, targetUrl) {
-    const logLine = `[${new Date().toISOString()}] ${method} ${targetUrl}\n`;
-
-    console.log(logLine.trim());
-
-    // Write to log file
-    accessLogStream.write(logLine);
-}
-
 function log(...args) {
-    const timestamp = new Date().toISOString();
-    const message = args
-        .map((arg) => {
-            if (typeof arg === 'object') {
-                try {
-                    return JSON.stringify(arg);
-                } catch {
-                    return '[Unserializable Object]';
-                }
-            }
-            return String(arg);
-        })
-        .join(' ');
-
-    const fullLine = `[${timestamp}] ${message}\n`;
-
-    console.log(fullLine.trim());
-    accessLogStream.write(fullLine);
+    const line = `[${new Date().toISOString()}] ${args
+        .map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a)))
+        .join(' ')}\n`;
+    console.log(line.trim());
+    accessLogStream.write(line);
 }
 
-// Handles HTTP requests through the proxy
-const httpServer = http.createServer((clientReq, clientRes) => {
+function requestHandler(clientReq, clientRes) {
     const proxyAuth = clientReq.headers['proxy-authorization'];
 
     if (!isAuthenticated(proxyAuth)) {
@@ -82,64 +83,85 @@ const httpServer = http.createServer((clientReq, clientRes) => {
     }
 
     const parsedUrl = url.parse(clientReq.url);
+    const isHttps = parsedUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
     const options = {
         hostname: parsedUrl.hostname,
-        port: parsedUrl.port || 80,
+        port: parsedUrl.port || (isHttps ? 443 : 80),
         path: parsedUrl.path,
         method: clientReq.method,
-        headers: clientReq.headers
+        headers: scrubHeaders(clientReq.headers)
     };
 
-    logRequest(clientReq.method, `${parsedUrl.protocol}//${parsedUrl.hostname}${parsedUrl.path}`);
+    log(clientReq.method, `${parsedUrl.protocol}//${parsedUrl.hostname}${parsedUrl.path}`);
 
-    const proxyReq = http.request(options, (res) => {
-        clientRes.writeHead(res.statusCode, res.headers);
-        res.pipe(clientRes, { end: true });
+    const proxyReq = mod.request(options, (res) => {
+        const respHeaders = { ...res.headers };
+        Object.keys(respHeaders).forEach((k) => {
+            if (HOP_BY_HOP.has(k.toLowerCase())) delete respHeaders[k];
+        });
+        respHeaders['connection'] = 'close';
+        clientRes.writeHead(res.statusCode || 502, respHeaders);
+        res.pipe(clientRes);
+    });
+
+    proxyReq.setTimeout(10_000, () => {
+        proxyReq.destroy(new Error('Upstream request timeout'));
     });
 
     proxyReq.on('error', (err) => {
         log('HTTP proxy error:', err.message);
-        clientRes.writeHead(500);
-        clientRes.end('Proxy Error');
+        const status = err.message === 'Upstream request timeout' ? 504 : 502;
+        if (!clientRes.headersSent) clientRes.writeHead(status);
+        clientRes.end(status === 504 ? 'Gateway Timeout' : 'Bad Gateway');
     });
 
-    clientReq.pipe(proxyReq, { end: true });
-});
+    clientReq.on('aborted', () => proxyReq.destroy());
+    clientReq.pipe(proxyReq);
+}
 
-// Handles HTTPS requests through the proxy (CONNECT method)
-httpServer.on('connect', (req, clientSocket, head) => {
+function connectHandler(req, clientSocket, head) {
     const proxyAuth = req.headers['proxy-authorization'];
-    log(`Received request with method: ${req.method} on url: ${req.url}`);
-
     if (!isAuthenticated(proxyAuth)) {
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n');
-        clientSocket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n');
-        clientSocket.write('\r\n');
-        clientSocket.destroy();
-        return;
+        clientSocket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
+        return clientSocket.destroy();
     }
 
-    const [host, port] = req.url.split(':');
+    const lastColon = req.url.lastIndexOf(':');
+    const host = lastColon > -1 ? req.url.slice(0, lastColon) : req.url;
+    const portStr = lastColon > -1 ? req.url.slice(lastColon + 1) : '';
+    const port = parseInt(portStr || '443', 10);
 
-    logRequest('CONNECT', req.url);
-    const targetSocket = net.connect(port, host, () => {
+    log('CONNECT', `${host}:${port}`);
+
+    const serverSocket = net.connect({ host, port }, () => {
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        targetSocket.write(head);
-        targetSocket.pipe(clientSocket);
-        clientSocket.pipe(targetSocket);
+        if (head && head.length) serverSocket.write(head);
+        serverSocket.pipe(clientSocket);
+        clientSocket.pipe(serverSocket);
     });
 
-    targetSocket.on('error', (err) => {
+    serverSocket.setTimeout(30_000, () => serverSocket.destroy());
+
+    serverSocket.on('error', (err) => {
         log('HTTPS tunnel error:', err.message);
-        clientSocket.write('HTTP/1.1 500 Tunnel Error\r\n\r\n');
+        try {
+            clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        } catch {}
         clientSocket.end();
     });
-});
 
-httpServer.listen(PROXY_PORT, () => {
-    log('*********************************************');
-    log('*********************************************');
-    log(`Proxy server listening on port ${PROXY_PORT}`);
-    log('*********************************************');
-    log('*********************************************');
-});
+    clientSocket.on('error', (err) => log('Client socket error:', err.message));
+}
+
+// HTTP Server
+const httpServer = http.createServer(requestHandler);
+httpServer.on('connect', connectHandler);
+httpServer.listen(HTTP_PORT, () => log(`HTTP proxy server listening on port ${HTTP_PORT}`));
+
+// HTTPS Server (optional, for HTTPS proxy clients)
+const httpsServer = https.createServer(serverOptions, requestHandler);
+httpsServer.on('connect', connectHandler);
+httpsServer.listen(HTTPS_PORT, () => log(`HTTPS proxy server listening on port ${HTTPS_PORT}`));
