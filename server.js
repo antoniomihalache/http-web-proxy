@@ -186,6 +186,7 @@ function connectHandler(req, clientSocket, head) {
     const host = lastColon > -1 ? req.url.slice(0, lastColon) : req.url;
     const portStr = lastColon > -1 ? req.url.slice(lastColon + 1) : '';
     const port = parseInt(portStr || '443', 10);
+    console.log('======================= req: ', req);
 
     log('CONNECT', `${host}:${port}`);
 
