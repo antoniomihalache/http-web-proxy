@@ -37,33 +37,89 @@ const HTTPS_PORT = process.env.HTTPS_PORT || 4433;
 const AUTH_USER = process.env.PROXY_USER;
 const AUTH_PASS = process.env.PROXY_PASSWORD;
 
+// RFC7230 hop-by-hop headers (Node lowercases header names)
 const HOP_BY_HOP = new Set([
     'connection',
-    'proxy-connection',
+    'proxy-connection', // non-standard but seen in the wild
     'keep-alive',
     'transfer-encoding',
     'upgrade',
-    'te',
-    'trailer'
+    'te', // TE header (Node lowercase)
+    'trailer', // Trailer header field name
+    'proxy-authenticate',
+    'proxy-authorization'
 ]);
 
-function scrubHeaders(headers) {
+function removeConnectionTokenHeaders(obj, connectionHeaderValue) {
+    if (!connectionHeaderValue) return;
+    // Connection: close, foo, Bar
+    connectionHeaderValue
+        .split(',')
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
+        .forEach((token) => {
+            delete obj[token];
+        });
+}
+
+function scrubRequestHeaders(headers) {
     const out = { ...headers };
+
+    // Always drop Proxy-Authorization before forwarding to origin
     delete out['proxy-authorization'];
+
+    // Remove hop-by-hop headers
     Object.keys(out).forEach((k) => {
         if (HOP_BY_HOP.has(k.toLowerCase())) delete out[k];
     });
+
+    // Also remove anything named by the Connection header tokens
+    removeConnectionTokenHeaders(out, headers['connection']);
+
+    // We’ll keep it simple and close upstream connections
     out['connection'] = 'close';
+
+    return out;
+}
+
+function scrubResponseHeaders(headers) {
+    const out = { ...headers };
+
+    // Remove hop-by-hop headers on the way back
+    Object.keys(out).forEach((k) => {
+        if (HOP_BY_HOP.has(k.toLowerCase())) delete out[k];
+    });
+
+    // Also remove anything named by the Connection header tokens
+    removeConnectionTokenHeaders(out, headers['connection']);
+
+    // keep it simple for clients
+    out['connection'] = 'close';
+
     return out;
 }
 
 // Basic Auth Validation
-function isAuthenticated(authHeader) {
+function isValidBasicAuthHeader(authHeader) {
     if (!authHeader || !authHeader.startsWith('Basic ')) return false;
     const encoded = authHeader.slice(6);
     const decoded = Buffer.from(encoded, 'base64').toString('utf8');
-    const [user, pass] = decoded.split(':');
+    const sep = decoded.indexOf(':');
+    if (sep === -1) return false;
+    const user = decoded.slice(0, sep);
+    const pass = decoded.slice(sep + 1);
     return user === AUTH_USER && pass === AUTH_PASS;
+}
+
+// Optional auth policy:
+// - If client sends Proxy-Authorization AND credentials are configured, validate it.
+// - If header is present but invalid => 407
+// - If header is absent => allow (no auth required)
+function shouldRejectForAuth(authHeader) {
+    const credsConfigured = AUTH_USER && AUTH_PASS;
+    if (!credsConfigured) return false; // no creds set => never require
+    if (!authHeader) return false; // optional => allow if not provided
+    return !isValidBasicAuthHeader(authHeader); // provided but invalid => reject
 }
 
 function log(...args) {
@@ -77,7 +133,7 @@ function log(...args) {
 function requestHandler(clientReq, clientRes) {
     const proxyAuth = clientReq.headers['proxy-authorization'];
 
-    if (!isAuthenticated(proxyAuth)) {
+    if (shouldRejectForAuth(proxyAuth)) {
         clientRes.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Proxy"' });
         return clientRes.end('Proxy Authentication Required');
     }
@@ -91,17 +147,13 @@ function requestHandler(clientReq, clientRes) {
         port: parsedUrl.port || (isHttps ? 443 : 80),
         path: parsedUrl.path,
         method: clientReq.method,
-        headers: scrubHeaders(clientReq.headers)
+        headers: scrubRequestHeaders(clientReq.headers)
     };
 
     log(clientReq.method, `${parsedUrl.protocol}//${parsedUrl.hostname}${parsedUrl.path}`);
 
     const proxyReq = mod.request(options, (res) => {
-        const respHeaders = { ...res.headers };
-        Object.keys(respHeaders).forEach((k) => {
-            if (HOP_BY_HOP.has(k.toLowerCase())) delete respHeaders[k];
-        });
-        respHeaders['connection'] = 'close';
+        const respHeaders = scrubResponseHeaders(res.headers);
         clientRes.writeHead(res.statusCode || 502, respHeaders);
         res.pipe(clientRes);
     });
@@ -123,7 +175,8 @@ function requestHandler(clientReq, clientRes) {
 
 function connectHandler(req, clientSocket, head) {
     const proxyAuth = req.headers['proxy-authorization'];
-    if (!isAuthenticated(proxyAuth)) {
+
+    if (shouldRejectForAuth(proxyAuth)) {
         clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\n');
         clientSocket.write('Proxy-Authenticate: Basic realm="Proxy"\r\n\r\n');
         return clientSocket.destroy();
